@@ -1170,7 +1170,8 @@ def cmd_add(cfg_path: Path, a):
 def main():
     if len(sys.argv) > 1 and sys.argv[1] == "_hook":
         return cmd_hook()
-    p = argparse.ArgumentParser(prog="teams", description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    # allow_abbrev=False: a `--rem host:path` argparse would accept is not the `--remote` stripped before relaying
+    p = argparse.ArgumentParser(prog="teams", description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter, allow_abbrev=False)
     p.add_argument("--config", type=Path, default=None, help="instance teams.json (default: $TEAMS_CONFIG or walk up from cwd)")
     p.add_argument("--remote", metavar="HOST:PATH", default=None, help="run the command on the instance of a project on another machine, over ssh (default: $TEAMS_REMOTE, or a remote.json found walking up)")
     sub = p.add_subparsers(dest="cmd", required=True)

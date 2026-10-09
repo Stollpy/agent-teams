@@ -52,7 +52,7 @@ def _remote_path(path: str) -> str:
     if path == "~" or path.startswith("~/"):
         rest = path[2:]
         return "~/" + shlex.quote(rest) if rest else "~"
-    return shlex.quote(path)
+    return shlex.quote("./" + path if path.startswith("-") else path)    # never an option of cd
 
 
 def remote_line(target: dict, argv: list) -> str:
@@ -119,16 +119,21 @@ def link(spec: str, inst_dir: str) -> int:
 
 
 def strip_option(argv: list, name: str) -> list:
-    """argv without `name value` / `name=value`: the server finds its own instance."""
-    out, skip = [], False
-    for x in argv:
-        if skip:
-            skip = False
-        elif x == name:
-            skip = True
-        elif not x.startswith(name + "="):
-            out.append(x)
-    return out
+    """argv without `name value` / `name=value`: the server finds its own instance.
+
+    Only the options ahead of the command are read: from the command (or a `--`) on, the words are
+    the command's own and travel untouched. `name` must be spelled in full, which the launcher's
+    parser enforces by refusing abbreviations.
+    """
+    out, i = [], 0
+    while i < len(argv) and argv[i].startswith("-") and argv[i] != "--":
+        if argv[i] == name:
+            i += 2
+            continue
+        if not argv[i].startswith(name + "="):
+            out.append(argv[i])
+        i += 1
+    return out + argv[i:]
 
 
 def main(target: dict, a, argv: list):
