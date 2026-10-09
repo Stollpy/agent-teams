@@ -59,6 +59,7 @@ class Relay(Fixture):
                            env={'SHELL': '/bin/sh', 'HOME': str(home), 'PATH': os.environ.get('PATH', '/usr/bin:/bin')})
         self.assertEqual(r.stdout.splitlines(), [str(home / 'work' / 'my project'), 'a b', "it's", '$HOME'])
         self.assertIn('&& teams ', remote.remote_line(TARGET, ['status']))       # the default command
+        self.assertIn("'cd ./-P && teams ", remote.remote_line({'host': 'h', 'path': '-P'}, ['status']))   # a path, never an option of cd
 
     def test_ssh_argv_places_options_before_the_host(self):
         target = {**TARGET, 'ssh_options': ['-p', '2222']}
@@ -133,6 +134,11 @@ class Link(Fixture):
         self.assertEqual(remote.strip_option(['--remote', 'h:p', 'task', 'list'], '--remote'), ['task', 'list'])
         self.assertEqual(remote.strip_option(['--remote=h:p', 'status'], '--remote'), ['status'])
         self.assertEqual(remote.strip_option(['msg', 'web', '--remote-ish'], '--remote'), ['msg', 'web', '--remote-ish'])
+        # only ahead of the command: from the command on, the words are its own and travel untouched
+        self.assertEqual(remote.strip_option(['--remote=a:p', '--remote', 'b:p', 'msg', 'web', '--', '--remote', 'next', 'word'], '--remote'),
+                         ['msg', 'web', '--', '--remote', 'next', 'word'])
+        self.assertEqual(remote.strip_option(['msg', 'web', '--remote=is broken'], '--remote'), ['msg', 'web', '--remote=is broken'])
+        self.assertEqual(remote.strip_option(['--remote', 'h:p', '--', 'status'], '--remote'), ['--', 'status'])
 
 
 class Dispatch(Fixture):
@@ -176,6 +182,13 @@ class Dispatch(Fixture):
         target, rest = self.dispatch(['--remote', 'other:/srv/x', 'status'])
         self.assertEqual(target, {'host': 'other', 'path': '/srv/x'})
         self.assertEqual(rest, ['status'])
+        _, rest = self.dispatch(['--remote', 'other:/srv/x', 'msg', 'web', '--', '--remote', 'next', 'word'])
+        self.assertEqual(rest, ['msg', 'web', '--', '--remote', 'next', 'word'])  # the message keeps its words
+        # one spelling only: an abbreviation would reach the server unstripped and be relayed again from there
+        for short in (['--r', 'other:/srv/x'], ['--remot', 'other:/srv/x'], ['--rem=other:/srv/x']):
+            with contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit) as caught:
+                self.dispatch([*short, 'status'])
+            self.assertEqual(caught.exception.code, 2, short)
 
     def test_config_and_teams_config_keep_the_instance_local(self):
         self.assertIsNone(self.dispatch(['--config', str(self.root / 'teams.json'), 'status']))
