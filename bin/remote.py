@@ -5,13 +5,13 @@ or `teams/remote.json` walking up from the cwd (a `teams.json` found nearer keep
 local). `init` and `link` only go remote with `--remote`; agents on the server have `TEAMS_CONFIG`
 set and never go remote. A command with a target runs over there as `teams <same arguments>`,
 inside the project, through the remote user's login shell so its PATH finds teams and claude.
+Every word reaches that shell between single quotes: none is left bare for it to expand.
 
 remote.json: {"host": "sky-a", "path": "~/work/project"}, optionally "command" (default "teams")
 and "ssh_options" (a list of ssh arguments). It belongs to one machine: keep it out of git.
 """
 import json
 import os
-import shlex
 import subprocess
 import sys
 from pathlib import Path
@@ -47,18 +47,25 @@ def find(cwd: Path, local_candidates) -> dict | None:
     return None
 
 
+def quote(word: str) -> str:
+    """A word as the server's shell must read it: always between single quotes, never bare.
+    A bare word is the shell's to expand, and which words it expands depends on the shell: zsh
+    turns `=ls` into `/bin/ls`, which `shlex.quote` leaves bare."""
+    return "'" + word.replace("'", "'\"'\"'") + "'"
+
+
 def _remote_path(path: str) -> str:
-    """Quote a path for the server's shell, leaving a leading ~ for it to expand."""
+    """The project path for the server's shell, leaving a leading ~ outside the quotes for it to expand."""
     if path == "~" or path.startswith("~/"):
         rest = path[2:]
-        return "~/" + shlex.quote(rest) if rest else "~"
-    return shlex.quote("./" + path if path.startswith("-") else path)    # never an option of cd
+        return "~/" + quote(rest) if rest else "~"
+    return quote("./" + path if path.startswith("-") else path)    # never an option of cd
 
 
 def remote_line(target: dict, argv: list) -> str:
     """`teams <argv>` in the project, through a login shell so the server's PATH finds teams and claude."""
-    inner = f"cd {_remote_path(target['path'])} && {target.get('command', 'teams')} {shlex.join(argv)}"
-    return f'exec "$SHELL" -lc {shlex.quote(inner)}'
+    inner = f"cd {_remote_path(target['path'])} && {target.get('command', 'teams')} {' '.join(quote(x) for x in argv)}"
+    return f'exec "$SHELL" -lc {quote(inner)}'
 
 
 def ssh_argv(target: dict, line: str | None = None, tty: bool = False, options=()) -> list:
@@ -90,7 +97,7 @@ def status(target: dict) -> dict:
                            capture_output=True, text=True, timeout=60)
     except (OSError, subprocess.TimeoutExpired) as exc:
         raise RemoteError(f"ssh {target['host']}: {exc}")
-    line = next((l for l in reversed(r.stdout.splitlines()) if l.startswith("{")), None)
+    line = next((l for l in reversed(r.stdout.split("\n")) if l.startswith("{")), None)
     if r.returncode != 0 or not line:
         why = (r.stderr.strip().splitlines() or [f"exit {r.returncode}, no JSON on stdout"])[-1]
         if "--json" in why:
