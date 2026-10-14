@@ -1,22 +1,48 @@
-"""Remote instances: the teams run on another machine, this one drives them over ssh.
+"""Remote instances: the teams run on another machine, this one drives them over ssh and shows them.
+
+    teams link sky-a:~/work/project      # writes ./.teams/remote.json: commands run from here drive that instance
+    teams up                             # `teams up` over there (tmux), then one local view per team
+    teams attach                         # open the missing views again: a reboot, a closed window, a lost network
+    teams down                           # `teams down` over there, then close the views and the board tunnel
+    teams status / task / msg / cost …   # relayed over ssh as they are
 
 The target is `--remote host:path`, else `$TEAMS_REMOTE`, else the nearest `.teams/remote.json`
 or `teams/remote.json` walking up from the cwd (a `teams.json` found nearer keeps the instance
 local). `init` and `link` only go remote with `--remote`; agents on the server have `TEAMS_CONFIG`
 set and never go remote. A command with a target runs over there as `teams <same arguments>`,
 inside the project, through the remote user's login shell so its PATH finds teams and claude.
-Every word reaches that shell between single quotes: none is left bare for it to expand.
+Every word reaches a shell between single quotes: none is left bare for it to expand.
 
-remote.json: {"host": "sky-a", "path": "~/work/project"}, optionally "command" (default "teams")
-and "ssh_options" (a list of ssh arguments). It belongs to one machine: keep it out of git.
+The teams live in tmux on the server, so they survive this machine sleeping or losing the network.
+A view is a terminal of the local driver (a programa workspace, a tmux window, or a command printed
+for you) in which a `sh -c` loop runs `ssh -t host`, then, through the login shell over there,
+`tmux new-session -A -s <session>-<team> -t =<session>`: a session grouped with the teams' one, so
+each view shows its own team whatever the others show, with the tmux the teams were started with.
+The loop reconnects when ssh exits 255 (connection failed or lost) and ends on any other code. The
+board listens on the server's 127.0.0.1; the same kind of loop, in the background, forwards it to
+the same port here. What this machine opened is recorded in `.state/views.json` beside remote.json
+(under ~/.local/state/teams/ for a target given by flag or environment).
+
+remote.json: {"host": "sky-a", "path": "~/work/project"}, optionally "command" (default "teams"),
+"ssh_options" (a list of ssh arguments), "terminal" (the local driver, as in teams.json) and
+"mouse" (false: no tmux mouse mode in the views). It belongs to one machine: keep it out of git.
 """
 import json
 import os
+import re
+import signal
+import socket
 import subprocess
 import sys
 from pathlib import Path
 
+import terminal
+
 CANDIDATES = (".teams/remote.json", "teams/remote.json")
+_VERSION = Path(__file__).resolve().parent.parent / "VERSION"
+ENGINE_VERSION = _VERSION.read_text().strip() if _VERSION.is_file() else "0"       # as bin/teams reads it
+KEEPALIVE = ("-o", "ServerAliveInterval=15", "-o", "ServerAliveCountMax=3")       # a dead connection is noticed within ~45 s
+RETRY = 3                                                                          # seconds before ssh is run again after a 255
 
 
 class RemoteError(OSError):
@@ -123,6 +149,137 @@ def link(spec: str, inst_dir: str) -> int:
     print(f"  teams: {names or '(none)'} — {'up' if st.get('up') else 'down'}, engine {st.get('engine', '?')}")
     print(f"next: `teams up` from anywhere under {f.parent.parent}")
     return 0
+
+
+# ---------- views: one local terminal per team, attached over ssh ----------------
+def _join(words) -> str:
+    """The words as one line for a shell, each through `quote`."""
+    return " ".join(quote(w) for w in words)
+
+
+def _loop(command: str, what: str) -> str:
+    """A POSIX loop running `command` again each time it exits 255 (ssh: connection failed or lost);
+    any other code (a detach, the session gone, the teams stopped) ends the loop with that code."""
+    lost = quote(f"{what}: connection lost, retrying in {RETRY} s")
+    return f'while :; do {command}; code=$?; [ "$code" -eq 255 ] || exit "$code"; echo {lost}; sleep {RETRY}; done'
+
+
+def view_line(target: dict, session: str, window: str, team: str, mouse: bool = True) -> str:
+    """The line typed into a view's terminal: attach a tmux session grouped with the teams' one, on this
+    team's window, and reconnect by itself. `sh -c` keeps it POSIX whatever shell the terminal runs.
+    Over there it goes through the login shell, as `remote_line` does, so it finds the tmux the teams
+    were started with; a terminal type the server has no terminfo for (xterm-ghostty…) falls back to
+    xterm-256color. Every word is quoted at every level: zsh reads a bare `=<session>` as a command."""
+    view = f"{session}-{team}"
+    tmux = ["tmux", "new-session", "-A", "-s", view, "-t", f"={session}", ";", "select-window", "-t", f"{view}:{window}"]
+    if mouse:                                    # the wheel scrolls tmux's history instead of the prompt's
+        tmux += [";", "set-option", "-t", view, "mouse", "on"]
+    inner = 'infocmp "$TERM" >/dev/null 2>&1 || export TERM=xterm-256color; exec ' + _join(tmux)
+    on_server = f'exec "$SHELL" -lc {quote(inner)}'
+    return "sh -c " + quote(_loop(_join(ssh_argv(target, on_server, tty=True, options=KEEPALIVE)), view))
+
+
+def view_alive(drv, handle: dict, marker: str) -> bool:
+    """A process on the view's terminal names its view session: the loop, or the ssh it runs.
+    True when that cannot be read (no tty, ps failing): a terminal is never typed into on a guess."""
+    tty = drv.tty(handle)
+    if not tty:
+        return True
+    try:
+        r = subprocess.run(["ps", "-ww", "-t", tty.removeprefix("/dev/"), "-o", "command="],
+                           capture_output=True, text=True, timeout=10)
+    except (OSError, subprocess.TimeoutExpired):
+        return True
+    if r.returncode != 0 or not r.stdout.strip():
+        return True
+    return re.search(rf"(?<![\w-]){re.escape(marker)}(?![\w-])", r.stdout) is not None     # teams-p-web is not teams-p-web-admin
+
+
+def state_file(target: dict) -> Path:
+    """Where this machine records the views of a target: beside remote.json, or under
+    ~/.local/state/teams for a target given by --remote or $TEAMS_REMOTE."""
+    if target.get("_file"):
+        return target["_file"].parent / ".state" / "views.json"
+    slug = re.sub(r"[^a-z0-9]+", "-", f"{target['host']}-{target['path']}".lower()).strip("-")
+    return Path.home() / ".local" / "state" / "teams" / slug / "views.json"
+
+
+def _read(f: Path) -> dict:
+    try:
+        return json.loads(f.read_text())
+    except (OSError, json.JSONDecodeError):
+        return {}
+
+
+def _write(f: Path, data: dict):
+    f.parent.mkdir(parents=True, exist_ok=True)
+    f.write_text(json.dumps(data, indent=2))
+
+
+def local_driver(target: dict, views: dict | None = None) -> terminal.Driver:
+    """The driver the recorded views were opened with, else the one remote.json asks for or the detected one."""
+    cfg = {k: v for k, v in target.items() if not k.startswith("_")}
+    root = state_file(target).parent.parent
+    if views and views.get("driver"):
+        return terminal.driver(views["driver"], cfg, root)
+    return terminal.detect(cfg, root)
+
+
+# ---------- the board, forwarded to the same port here ---------------------------
+def board_port(url: str | None) -> int | None:
+    m = re.match(r"https?://[^/]+:(\d+)", url or "")
+    return int(m.group(1)) if m else None
+
+
+def port_free(port: int) -> bool:
+    """Nothing is bound to 127.0.0.1:<port> here — asked as ssh will ask, with SO_REUSEADDR."""
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        try:
+            s.bind(("127.0.0.1", port))
+        except OSError:
+            return False
+    return True
+
+
+def open_tunnel(target: dict, port: int, log: Path) -> int | None:
+    """Forward the server's 127.0.0.1:<port> to the same port here, with a reconnecting loop in the
+    background; its pid, which is also its process group. None when the port is busy here: `ssh -N`
+    exits 255 on a failed forward too, so the loop would spin."""
+    if not port_free(port):
+        return None
+    ssh = ssh_argv(target, options=["-N", "-o", "ExitOnForwardFailure=yes", *KEEPALIVE, "-L", f"{port}:127.0.0.1:{port}"])
+    log.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        with open(log, "ab") as fh:
+            p = subprocess.Popen(["sh", "-c", _loop(_join(ssh), f"board tunnel {port}")],
+                                 stdin=subprocess.DEVNULL, stdout=fh, stderr=fh, start_new_session=True)
+    except OSError:
+        return None
+    return p.pid
+
+
+def _tunnel_alive(tunnel: dict) -> bool:
+    """The recorded pid still runs the forward of the recorded port. A pid alone proves nothing:
+    after a reboot it belongs to another program, which `close_tunnel` must not signal."""
+    pid, port = tunnel.get("pid"), tunnel.get("port")
+    if not pid or not port:
+        return False
+    try:
+        r = subprocess.run(["ps", "-ww", "-p", str(pid), "-o", "command="], capture_output=True, text=True, timeout=10)
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+    return quote(f"{port}:127.0.0.1:{port}") in r.stdout          # the forward as the loop wrote it
+
+
+def close_tunnel(views: dict):
+    """SIGTERM to the recorded tunnel's whole process group: the loop, its ssh, its sleep."""
+    tunnel = views.get("tunnel") or {}
+    if _tunnel_alive(tunnel):
+        try:
+            os.killpg(tunnel["pid"], signal.SIGTERM)
+        except OSError:
+            pass
 
 
 def strip_option(argv: list, name: str) -> list:
