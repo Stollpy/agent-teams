@@ -14,6 +14,7 @@
   teams add <name> --cwd <dir> [--purpose "..."]   register a new team + prompt stub
   teams cmd <team>                      print the exact `claude` command for a team
   teams link <host>:<path> [--dir .teams]   point this directory at an instance on another machine (bin/remote.py)
+  teams attach                          remote instance: open the local views of its teams again
 
 Engine vs instance: this checkout is the ENGINE (code, default prompts, workers, board UI); put
 bin/teams on your PATH once (see install.sh). A project holds one INSTANCE directory (.teams/ by
@@ -23,7 +24,7 @@ prompts/ or workers/ file present in the instance overrides the engine's. An ins
 its own engine (git submodule at .teams/engine) is run with that engine automatically.
 Terminals: `terminal` in teams.json = auto (default) | programa | tmux | manual — see bin/terminal.py.
 Remote: `--remote host:path`, $TEAMS_REMOTE or a remote.json found walking up runs the command on
-that machine over ssh — see bin/remote.py.
+that machine over ssh; `up`, `attach` and `down` also open and close one local view per team — see bin/remote.py.
 """
 import argparse, json, os, re, shlex, shutil, signal, subprocess, sys, textwrap, time
 from datetime import datetime
@@ -1201,6 +1202,7 @@ def main():
     s = sub.add_parser("add"); s.add_argument("name"); s.add_argument("--cwd", required=True, help="the team's directory (relative to your shell)"); s.add_argument("--purpose")
     s = sub.add_parser("link"); s.add_argument("target", metavar="HOST:PATH", help="the project on the other machine, e.g. sky-a:~/work/project")
     s.add_argument("--dir", default=".teams", help="local directory receiving remote.json (default: ./.teams)")
+    sub.add_parser("attach")
     a = p.parse_args()
     if a.cmd == "link":
         return remote.link(a.target, a.dir)
@@ -1211,6 +1213,8 @@ def main():
         target = remote.find(Path.cwd().resolve(), CONFIG_CANDIDATES)
     if target:
         sys.exit(remote.main(target, a, remote.strip_option(sys.argv[1:], "--remote")))
+    if a.cmd == "attach":
+        die("attach opens the views of a remote instance — `teams link <host>:<path>` first")
     if a.cmd == "init":
         return cmd_init(a)
     if a.config is None:
