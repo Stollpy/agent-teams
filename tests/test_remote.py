@@ -59,7 +59,6 @@ class Relay(Fixture):
                            env={'SHELL': '/bin/sh', 'HOME': str(home), 'PATH': os.environ.get('PATH', '/usr/bin:/bin')})
         self.assertEqual(r.stdout.splitlines(), [str(home / 'work' / 'my project'), 'a b', "it's", '$HOME'])
         self.assertIn('&& teams ', remote.remote_line(TARGET, ['status']))       # the default command
-        self.assertIn("'cd ./-P && teams ", remote.remote_line({'host': 'h', 'path': '-P'}, ['status']))   # a path, never an option of cd
 
     def test_ssh_argv_places_options_before_the_host(self):
         target = {**TARGET, 'ssh_options': ['-p', '2222']}
@@ -85,6 +84,64 @@ class Relay(Fixture):
             remote.main(TARGET, SimpleNamespace(cmd='task'), ['task', 'list'])
         relay.assert_called_once_with(TARGET, ['task', 'list'])
 
+    def test_quote_never_leaves_a_word_bare(self):
+        self.assertEqual(remote.quote('status'), "'status'")
+        self.assertEqual(remote.quote('=ls'), "'=ls'")
+        self.assertEqual(remote.quote(''), "''")
+        self.assertEqual(remote.quote("it's"), "'it'\"'\"'s'")
+        line = remote.remote_line({'host': 'h', 'path': '~/my project'}, ['msg', 'web', '=ls'])
+        self.assertEqual(line, 'exec "$SHELL" -lc ' + remote.quote("cd ~/'my project' && teams 'msg' 'web' '=ls'"))
+
+
+HOSTILE = ['=ls', '==', '=', '=nosuchcmd_zz', '%self', '~', '~root', '*', '?', '$HOME', '`id`', '$(id)', 'a b', "it's", '', '-n', '--',
+           '{a,b}', '<1-3>', '!!', '#x', 'a\\b', '\\', 'é', 'a\nb', ';', '|', '&', '>', 'x=y', '[a]', 'a\'b"c', '\t', '=(ls)', '<(ls)']
+
+
+class Shells(Fixture):
+    """The relay line read by real shells acting as the server's login shell: every word arrives as typed."""
+    def setUp(self):
+        super().setUp()
+        self.home = self.root.resolve() / 'home'                  # the remote user's home: no start-up file in it
+        for name in ('proj', '=ls', '=x y', '-P'):
+            (self.home / name).mkdir(parents=True)
+        self.there = self.root.resolve() / 'teams-there'          # stands for `teams` on the server: says where it runs and what it received
+        self.there.write_text('#!/bin/sh\nprintf "teams-there\\n"; pwd\nfor word; do printf "%s\\0" "$word"; done\n')
+        self.there.chmod(0o755)
+
+    def arrive(self, shell, path, words):
+        """The relay line as ssh hands it to `shell`: (the directory the command ran in, the words it received)."""
+        target = {'host': 'h', 'path': path, 'command': "'" + str(self.there) + "'"}
+        env = {'SHELL': shell, 'HOME': str(self.home), 'ZDOTDIR': str(self.home), 'ENV': '', 'PATH': '/usr/bin:/bin'}
+        r = subprocess.run([shell, '-c', remote.remote_line(target, words)], capture_output=True, text=True, timeout=30, env=env, cwd=self.home)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        cwd, _, received = r.stdout.rpartition('teams-there\n')[2].partition('\n')   # a login shell may print before the command does
+        return cwd, received.split('\0')[:-1]
+
+    def verbatim(self, name):
+        shell = next((p for p in (f'/bin/{name}', f'/usr/bin/{name}', f'/usr/local/bin/{name}', f'/opt/homebrew/bin/{name}') if os.path.exists(p)), None)
+        if not shell:
+            self.skipTest(f'{name} is not installed here')
+        self.assertEqual(self.arrive(shell, str(self.home / 'proj'), ['msg', *HOSTILE])[1], ['msg', *HOSTILE])
+        for path, there in (('=ls', self.home / '=ls'), ('~/=x y', self.home / '=x y'), ('-P', self.home / '-P'), ('~', self.home),
+                            ('~/proj', self.home / 'proj')):
+            with self.subTest(path=path):
+                self.assertEqual(self.arrive(shell, path, ['status']), (str(there), ['status']))
+
+    def test_sh(self):
+        self.verbatim('sh')
+
+    def test_bash(self):
+        self.verbatim('bash')
+
+    def test_zsh(self):
+        self.verbatim('zsh')
+
+    def test_dash(self):
+        self.verbatim('dash')
+
+    def test_ksh(self):
+        self.verbatim('ksh')
+
 
 class Status(Fixture):
     def answer(self, stdout='', stderr='', code=0):
@@ -94,6 +151,12 @@ class Status(Fixture):
         with self.answer('Welcome to sky-a\n{"up": false, "teams": []}\n') as run:
             self.assertEqual(remote.status(TARGET), {'up': False, 'teams': []})
         self.assertEqual(run.call_args.args[0], ['ssh', 'sky-a', remote.remote_line(TARGET, ['status', '--json'])])
+
+    def test_status_reads_a_line_holding_unicode_line_separators(self):
+        purpose = 'first' + chr(0x2028) + 'second' + chr(0x2029) + 'third' + chr(0x85) + 'end'   # str.splitlines() cuts at each of them
+        answer = {'up': True, 'teams': [{'name': 'web', 'purpose': purpose}]}
+        with self.answer('Welcome to sky-a\n' + json.dumps(answer, ensure_ascii=False) + '\n'):
+            self.assertEqual(remote.status(TARGET), answer)                    # one line of JSON is read as one line
 
     def test_status_failures_name_the_target_and_hint_an_old_engine(self):
         with self.answer(stderr='teams: no teams.json found here or above\n', code=1):
