@@ -282,6 +282,122 @@ def close_tunnel(views: dict):
             pass
 
 
+# ---------- up / attach / down: the teams over there, their views here ------------
+def _close(target: dict, views: dict):
+    """Close what a views state records: every view still there, then the board tunnel."""
+    drv = local_driver(target, views)
+    for name, h in views.get("handles", {}).items():
+        if drv.exists(h):
+            drv.close(h)
+            print(f"[{name}] view closed {drv.describe(h)}")
+    close_tunnel(views)
+
+
+def _open_views(target: dict, st: dict, drv, handles: dict):
+    """One view per team, the primary's last so it ends up in front: open the missing ones, type the
+    line again where the terminal is still there but its view is gone, leave the live ones alone."""
+    host, where = target["host"], f"{target['host']}:{target['path']}"
+    teams = st.get("teams", [])
+    if drv.name == "manual":
+        print("No programa or tmux here — run these yourself, one per terminal:\n")
+    for t in [t for t in teams if not t.get("primary")] + [t for t in teams if t.get("primary")]:
+        name, there = t["name"], t.get("handle") or {}
+        if not there.get("window"):
+            print(f"[{name}] no terminal over there — `teams up --resume` recreates it")
+            continue
+        view = f"{there['session']}-{name}"
+        line = view_line(target, there["session"], there["window"], name, target.get("mouse", True))
+        if drv.name == "manual":
+            print(f"# {name}\n{line}\n")
+            continue
+        h = handles.get(name)
+        if h and drv.exists(h):
+            if view_alive(drv, h, view):
+                print(f"[{name}] view already open {drv.describe(h)}")
+                continue
+            verb = "reconnected"                 # the terminal is still there, its ssh is gone
+        else:
+            h = drv.open(name, t.get("title", name), Path.cwd(), f"{t.get('purpose', '')} (on {where})".strip())
+            if not h:
+                raise RemoteError(f"{drv.name}: could not open a view for {name}")
+            handles[name] = h
+            drv.wait_ready(h)
+            verb = "opened"
+        if not drv.send(h, line + "\n"):
+            raise RemoteError(f"{drv.name}: could not type into {name}'s view")
+        print(f"[{name}] view {verb} {drv.describe(h)} → {host}")
+
+
+def _forward_board(target: dict, st: dict, tunnel: dict, log: Path) -> dict:
+    """The tunnel to record: the recorded one while it forwards the board's port, else a new one, else none."""
+    host, port = target["host"], board_port(st.get("board"))
+    if port and tunnel.get("port") == port and _tunnel_alive(tunnel):
+        print(f"board → http://127.0.0.1:{port}  (forwarded from {host}, already running)")
+        return tunnel
+    close_tunnel({"tunnel": tunnel})
+    if not port:
+        return {}
+    pid = open_tunnel(target, port, log)
+    if not pid:
+        by_hand = _join(ssh_argv(target, options=["-N", "-L", f"{port}:127.0.0.1:{port}"]))
+        print(f"board: port {port} is busy here, not forwarded — free it then `teams attach`, or by hand "
+              f"(change the first {port} for another local port): {by_hand}")
+        return {}
+    print(f"board → http://127.0.0.1:{port}  (forwarded from {host})")
+    return {"pid": pid, "port": port}
+
+
+def attach(target: dict, st: dict) -> int:
+    """Open a local view for every team that lacks one, forward the board, select the primary's view."""
+    host = target["host"]
+    if not st.get("up"):
+        raise RemoteError(f"the teams are down on {host} — `teams up` starts them")
+    if st.get("driver") != "tmux":
+        raise RemoteError(f"the teams on {host} run with the {st.get('driver')!r} driver; a remote instance needs "
+                          f"\"terminal\": \"tmux\" in its teams.json (then `teams down` and `teams up`)")
+    if st.get("engine") != ENGINE_VERSION:
+        print(f"teams: engine {st.get('engine', '?')} on {host}, {ENGINE_VERSION} here — bring both to the same version",
+              file=sys.stderr)
+    sf = state_file(target)
+    views = _read(sf)
+    if views and views.get("started_at") != st.get("started_at"):    # another run over there: these views show closed windows
+        _close(target, views)
+        views = {}
+    drv = local_driver(target, views)
+    views = {"driver": drv.name, "handles": views.get("handles", {}), "started_at": st.get("started_at"),
+             "tunnel": views.get("tunnel") or {}, "target": f"{host}:{target['path']}"}
+    try:
+        _open_views(target, st, drv, views["handles"])
+        views["tunnel"] = _forward_board(target, st, views["tunnel"], sf.parent / "tunnel.log")
+    finally:
+        _write(sf, views)                        # whatever was opened is recorded: `teams down` can close it
+    primary = next((t["name"] for t in st.get("teams", []) if t.get("primary")), None)
+    if primary in views["handles"]:
+        drv.select(views["handles"][primary])
+        hint = drv.attach_hint()
+        print(f"\n{primary} is selected - talk to it there. `teams down` stops the teams on {host}."
+              + (f"\n{hint}" if hint else ""))
+    return 0
+
+
+def up(target: dict, resume: bool) -> int:
+    """`teams up` over there, then the views. The server refuses a second `up`: say first that `teams attach` is the way."""
+    st = status(target)
+    if st.get("up") and not resume:
+        raise RemoteError(f"teams already up on {target['host']} — `teams attach` opens the views, `teams down` stops them")
+    code = run(target, ["up", "--resume"] if resume else ["up"])
+    return code or attach(target, status(target))
+
+
+def down(target: dict) -> int:
+    """`teams down` over there first: each view's tmux ends and its loop stops by itself. Then close what is left here."""
+    code = run(target, ["down"])
+    sf = state_file(target)
+    _close(target, _read(sf))
+    sf.unlink(missing_ok=True)
+    return code
+
+
 def strip_option(argv: list, name: str) -> list:
     """argv without `name value` / `name=value`: the server finds its own instance.
 
@@ -301,5 +417,11 @@ def strip_option(argv: list, name: str) -> list:
 
 
 def main(target: dict, a, argv: list):
-    """Run a command whose instance lives on another machine."""
+    """Run a command whose instance lives on another machine; up, attach and down also manage the views here."""
+    if a.cmd == "up" and not a.dry_run:
+        return up(target, a.resume)
+    if a.cmd == "attach":
+        return attach(target, status(target))
+    if a.cmd == "down":
+        return down(target)
     relay(target, argv)
